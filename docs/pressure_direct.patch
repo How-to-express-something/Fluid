@@ -1,0 +1,182 @@
+diff --git a/source/fluid.cu b/source/fluid.cu
+index 209dbce..e33f3c9 100644
+--- a/source/fluid.cu
++++ b/source/fluid.cu
+@@ -1,4 +1,4 @@
+-﻿#include "fluid.h"
++#include "fluid.h"
+ #include "fluid_kernel.h"
+ #include <cuda_gl_interop.h>
+ #include <algorithm>
+@@ -40,7 +40,6 @@ FluidSim::FluidSim(const SimConfig& cfg,const std::vector<float>& density):confi
+     try {
+         allocate();
+         check(cudaMemcpy(denA_,density.data(),density.size()*sizeof(float),cudaMemcpyHostToDevice));
+-        buildPressureGraph();
+     } catch (...) { release(); throw; }
+ }
+ void FluidSim::allocate() {
+@@ -53,54 +52,10 @@ void FluidSim::allocate() {
+     check(cudaMemset(pA_,0,bytes)); check(cudaMemset(pB_,0,bytes)); check(cudaMemset(div_,0,bytes));
+ }
+ FluidSim::~FluidSim() { release(); }
+-void FluidSim::buildPressureGraph() {
+-    // Only grid size and iteration count affect jacobi. Resize replaces all resources.
+-    // Keep the old executable valid until the replacement is fully constructed.
+-    cudaStream_t stream=nullptr;
+-    cudaGraph_t graph=nullptr;
+-    cudaGraphExec_t exec=nullptr;
+-    bool capturing=false;
+-    float* src=pA_;
+-    float* dst=pB_;
+-    try {
+-        check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+-        check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+-        capturing=true;
+-        for (int i=0;i<params_.jacobiIter;++i) {
+-            fluidkernels::pressure(src,div_,dst,params_,stream);
+-            check(cudaGetLastError());
+-            std::swap(src,dst); // CPU recording logic; replay does not execute this swap.
+-        }
+-        const auto endError=cudaStreamEndCapture(stream,&graph);
+-        capturing=false;
+-        check(endError);
+-        check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+-        // All graph launches use stream 0. Rebuilding is exceptional, not per-frame.
+-        if (pressureGraphExec_) check(cudaStreamSynchronize(0));
+-    } catch (...) {
+-        if (capturing) cleanup(cudaStreamEndCapture(stream,&graph));
+-        if (exec) cleanup(cudaGraphExecDestroy(exec));
+-        if (graph) cleanup(cudaGraphDestroy(graph));
+-        if (stream) cleanup(cudaStreamDestroy(stream));
+-        throw;
+-    }
+-    if (pressureGraphExec_) cleanup(cudaGraphExecDestroy(pressureGraphExec_));
+-    pressureGraphExec_=exec;
+-    pressureResult_=src;
+-    pressureGraphIterations_=params_.jacobiIter;
+-    cleanup(cudaGraphDestroy(graph)); // Executable retains its own instantiated nodes.
+-    cleanup(cudaStreamDestroy(stream)); // Capture stream is not needed for replay.
+-}
+ void FluidSim::release() noexcept {
+     if (mapped_) { cleanup(cudaGraphicsUnmapResources(1,&res_,0)); mapped_=false; }
+     if (res_) { cleanup(cudaGraphicsUnregisterResource(res_)); res_=nullptr; }
+     tex_=0;
+-    if (pressureGraphExec_) {
+-        cleanup(cudaStreamSynchronize(0));
+-        cleanup(cudaGraphExecDestroy(pressureGraphExec_));
+-        pressureGraphExec_=nullptr;
+-    }
+-    pressureResult_=nullptr; pressureGraphIterations_=0;
+     for (void* p:{static_cast<void*>(velA_),static_cast<void*>(velB_),static_cast<void*>(velRhs_),
+         static_cast<void*>(denA_),static_cast<void*>(denB_),static_cast<void*>(pA_),static_cast<void*>(pB_),static_cast<void*>(div_)})
+         if (p) cleanup(cudaFree(p));
+@@ -112,8 +67,6 @@ void FluidSim::swapState(FluidSim& other) noexcept {
+     swap(config_,other.config_); swap(params_,other.params_);
+     swap(velA_,other.velA_); swap(velB_,other.velB_); swap(velRhs_,other.velRhs_);
+     swap(denA_,other.denA_); swap(denB_,other.denB_); swap(pA_,other.pA_); swap(pB_,other.pB_); swap(div_,other.div_);
+-    swap(pressureGraphExec_,other.pressureGraphExec_);
+-    swap(pressureResult_,other.pressureResult_); swap(pressureGraphIterations_,other.pressureGraphIterations_);
+     swap(injections_,other.injections_); swap(tex_,other.tex_); swap(res_,other.res_); swap(mapped_,other.mapped_);
+ }
+ FluidSim::FluidSim(FluidSim&& other) noexcept { swapState(other); }
+@@ -176,7 +129,6 @@ void FluidSim::step() {
+     const SimParams p=params_; // One consistent snapshot for the whole step.
+ 
+     const auto bytes=static_cast<std::size_t>(gridW())*gridH()*sizeof(float);
+-    if (pressureGraphIterations_!=p.jacobiIter) buildPressureGraph();
+     using namespace fluidkernels;
+ 
+     for (const auto& f:injections_) { addForces(velA_,denA_,p,f,true); check(cudaGetLastError()); }
+@@ -193,9 +145,12 @@ void FluidSim::step() {
+     }
+     divergence(velA_,div_,p); check(cudaGetLastError());
+     check(cudaMemsetAsync(pA_,0,bytes,0)); check(cudaMemsetAsync(pB_,0,bytes,0));
+-    check(cudaGraphLaunch(pressureGraphExec_,0));
++    for (int i=0;i<p.jacobiIter;++i) {
++        pressure(pA_,div_,pB_,p); check(cudaGetLastError());
++        std::swap(pA_,pB_);
++    }
+ 
+-    project(velA_,pressureResult_,velB_,p); check(cudaGetLastError());
++    project(velA_,pA_,velB_,p); check(cudaGetLastError());
+     std::swap(velA_,velB_);
+     advectDensity(denA_,velA_,denB_,p); check(cudaGetLastError());
+     std::swap(denA_,denB_);
+@@ -211,7 +166,6 @@ void FluidSim::resize(int w,int h) {
+     FluidSim next({w,h},std::vector<float>(static_cast<std::size_t>(w)*h,0));
+     next.params_=params_; next.params_.gridW=w; next.params_.gridH=h;
+     validateParams(next.params_,next.config_);
+-    if (next.pressureGraphIterations_!=next.params_.jacobiIter) next.buildPressureGraph();
+     attachGLTexture(0);
+     swapState(next);
+ }
+diff --git a/source/fluid.h b/source/fluid.h
+index 5b77e16..ff23380 100644
+--- a/source/fluid.h
++++ b/source/fluid.h
+@@ -1,4 +1,4 @@
+-﻿#pragma once
++#pragma once
+ #include <glad/gl.h>
+ #include <cuda_runtime.h>
+ #include "sim_types.h"
+@@ -35,7 +35,6 @@ public:
+ private:
+     void release() noexcept;
+     void allocate();
+-    void buildPressureGraph();
+     void swapState(FluidSim&) noexcept;
+     SimConfig config_;
+     SimParams params_;
+@@ -43,9 +42,6 @@ private:
+     float2 *velA_ = nullptr, *velB_ = nullptr, *velRhs_ = nullptr;
+     float *denA_ = nullptr, *denB_ = nullptr;
+     float *pA_ = nullptr, *pB_ = nullptr, *div_ = nullptr;
+-    cudaGraphExec_t pressureGraphExec_ = nullptr;
+-    float* pressureResult_ = nullptr; // Captured final output; pA_/pB_ stay fixed.
+-    int pressureGraphIterations_ = 0;
+     std::vector<FluidInjection> injections_;
+     GLuint tex_ = 0;
+     cudaGraphicsResource* res_ = nullptr;
+diff --git a/source/fluid_kernel.cu b/source/fluid_kernel.cu
+index f5374dd..1b39008 100644
+--- a/source/fluid_kernel.cu
++++ b/source/fluid_kernel.cu
+@@ -1,4 +1,4 @@
+-﻿#include "fluid_kernel.h"
++#include "fluid_kernel.h"
+ #include <cmath>
+ 
+ namespace fluidkernels {
+@@ -97,7 +97,7 @@ void addForces(float2* v,float* d,SimParams p,FluidInjection f,bool brush) { add
+ void advectVelocity(const float2* a,float2* b,SimParams p) { advectVector2<<<grid(p),dim3(16,16)>>>(a,b,p); }
+ void diffuseVelocity(const float2* a,const float2* rhs,float2* b,SimParams p) { diffuse<<<grid(p),dim3(16,16)>>>(a,rhs,b,p); }
+ void divergence(const float2* v,float* d,SimParams p) { divergenceKernel<<<grid(p),dim3(16,16)>>>(v,d,p); }
+-void pressure(const float* a,const float* d,float* b,SimParams p,cudaStream_t stream) { jacobi<<<grid(p),dim3(16,16),0,stream>>>(a,d,b,p); }
++void pressure(const float* a,const float* d,float* b,SimParams p) { jacobi<<<grid(p),dim3(16,16)>>>(a,d,b,p); }
+ void project(const float2* a,const float* pressure,float2* b,SimParams p) { gradientSubtract<<<grid(p),dim3(16,16)>>>(a,pressure,b,p); }
+ void advectDensity(const float* a,const float2* v,float* b,SimParams p) { advectScalar<<<grid(p),dim3(16,16)>>>(a,v,b,p); }
+ }
+diff --git a/source/fluid_kernel.h b/source/fluid_kernel.h
+index 5c9eeb2..411cf74 100644
+--- a/source/fluid_kernel.h
++++ b/source/fluid_kernel.h
+@@ -1,14 +1,14 @@
+-﻿#pragma once
++#pragma once
+ #include <cuda_runtime.h>
+ #include "sim_types.h"
+ 
+-// Host launch wrappers. Stream 0 by default; pressure also supports graph capture.
++// Host launch wrappers. All kernels use stream 0 and distinct input/output arrays.
+ namespace fluidkernels {
+ void addForces(float2* velocity, float* density, SimParams, FluidInjection, bool brush);
+ void advectVelocity(const float2* src, float2* dst, SimParams);
+ void diffuseVelocity(const float2* src, const float2* rhs, float2* dst, SimParams);
+ void divergence(const float2* velocity, float* div, SimParams);
+-void pressure(const float* src, const float* div, float* dst, SimParams, cudaStream_t stream = 0);
++void pressure(const float* src, const float* div, float* dst, SimParams);
+ void project(const float2* src, const float* pressure, float2* dst, SimParams);
+ void advectDensity(const float* src, const float2* velocity, float* dst, SimParams);
+ }
