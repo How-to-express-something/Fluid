@@ -4,7 +4,16 @@
 
 使用 C++17、CUDA 和 OpenGL 3.3 实现的实时二维流体演示。CUDA 负责求解，OpenGL 负责显示，Dear ImGui 提供参数面板。
 
+## 效果展示
+
+![流体运行效果](assets/demo.png)
+
+<details>
+<summary>查看参数面板截图</summary>
+
 ![实际参数面板与密度显示](assets/parameter_panel.png)
+
+</details>
 
 ## 功能与技术点
 
